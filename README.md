@@ -4,6 +4,14 @@
 
 `pgmoneta` is named after the Roman Goddess of Memory.
 
+# pgmoneta-plus
+
+Replaced usage of pg_receivewal inside pgmoneta with a pgmoneta native solution.
+
+Created a foundation for a pgmoneta library that can be used for WAL interaction.
+
+Added log resolution function.
+
 ## Features
 
 * Full backup
