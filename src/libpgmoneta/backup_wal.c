@@ -14,7 +14,7 @@
 #include <utils.h>
 #include <xlogdefs.h>
 //#include <port.h>
-
+#include <assert.h>
 //#include <streamutil.h>
 //#include <xlogdefs.h>
 
@@ -79,6 +79,9 @@ h localhost
 
 #define USECS_PER_SEC	INT64CONST(1000000)
 
+/* Time to sleep between reconnection attempts */
+#define RECONNECT_SLEEP_TIME 5
+
 //#define errno (*_errno())
 
 typedef int pgsocket;
@@ -112,6 +115,11 @@ pg_free(void *ptr)
 		free(ptr);
 }
 
+/*
+ * This is the default value for wal_segment_size to be used when initdb is run
+ * without the --wal-segsize option.  It must be a valid segment size.
+ */
+#define DEFAULT_XLOG_SEG_SIZE	(16*1024*1024)
 
 /*
  * Determine starting location for streaming, based on any existing xlog
@@ -591,6 +599,7 @@ CopyStreamPoll(PGconn *conn, long timeout_ms, pgsocket stop_socket)
 	if (connsocket < 0)
 	{
 		//pg_log_error("invalid socket: %s", PQerrorMessage(conn));
+        pgmoneta_log_error("invalid socket: %s", PQerrorMessage(conn));
 		return -1;
 	}
 
@@ -1063,18 +1072,20 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	 */
 	if (walfile == NULL)
 	{
+        pgmoneta_log_error("walfile == NULL");
 		/* No file open yet */
 		if (xlogoff != 0)
 		{
 			//pg_log_error("received write-ahead log record for offset %u with no file open",
 			//			 xlogoff);
-            pgmoneta_log_error("received write-ahead log record for offset %u with no file open",
+            pgmoneta_log_info("received write-ahead log record for offset %u with no file open",
 						 xlogoff);
 			return false;
 		}
 	}
 	else
 	{
+        pgmoneta_log_info("walfile != NULL");
 		/* More data in existing segment */
 		if (stream->walmethod->get_current_pos(walfile) != xlogoff)
 		{
@@ -1107,10 +1118,11 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 			if (!open_walfile(stream, *blockpos))
 			{
 				/* Error logged by open_walfile */
+                pgmoneta_log_error("!open_walfile(stream, *blockpos)");
 				return false;
 			}
 		}
-
+        pgmoneta_log_info("stream->walmethod->write");
 		if (stream->walmethod->write(walfile, copybuf + hdr_len + bytes_written,
 									 bytes_to_write) != bytes_to_write)
 		{
@@ -1130,6 +1142,7 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 		*blockpos += bytes_to_write;
 		xlogoff += bytes_to_write;
 
+        pgmoneta_log_info("Write was successful, advance our position");
 		/* Did we reach the end of a WAL segment? */
 		if (XLogSegmentOffset(*blockpos, WalSegSz) == 0)
 		{
@@ -1254,15 +1267,17 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 			/* Check the message type. */
 			if (copybuf[0] == 'k')
 			{
+                pgmoneta_log_info("copybuf[0] == 'k'");
 				if (!ProcessKeepaliveMsg(conn, stream, copybuf, r, blockpos,
 										 &last_status))
 					goto error;
 			}
 			else if (copybuf[0] == 'w')
 			{
+                pgmoneta_log_info("copybuf[0] == 'w'");
 				if (!ProcessXLogDataMsg(conn, stream, copybuf, r, &blockpos))
 					goto error;
-
+                
 				/*
 				 * Check if we should continue streaming, or abort at this
 				 * point.
@@ -1421,7 +1436,7 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 			reportFlushPosition = false;
 		slotcmd[0] = 0;
 	}
-
+    pgmoneta_log_info("ready to start ReceiveXlogStream");
 	if (stream->sysidentifier != NULL)
 	{
 		/* Validate system identifier hasn't changed */
@@ -1462,7 +1477,7 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 		}
 		PQclear(res);
 	}
-
+    pgmoneta_log_info("ReceiveXlogStream to while loop");
 	/*
 	 * initialize flush position to starting point, it's the caller's
 	 * responsibility that that's sane.
@@ -1658,6 +1673,116 @@ error:
 }
 
 /*
+ * "Safe" wrapper around strdup().
+ */
+char *
+pg_strdup(const char *in)
+{
+	char	   *tmp;
+
+	if (!in)
+	{
+		fprintf(stderr,
+				("cannot duplicate null pointer (internal error)\n"));
+		exit(EXIT_FAILURE);
+	}
+	tmp = strdup(in);
+	if (!tmp)
+	{
+		fprintf(stderr, ("out of memory\n"));
+		exit(EXIT_FAILURE);
+	}
+	return tmp;
+}
+
+/*
+ * Run IDENTIFY_SYSTEM through a given connection and give back to caller
+ * some result information if requested:
+ * - System identifier
+ * - Current timeline ID
+ * - Start LSN position
+ * - Database name (NULL in servers prior to 9.4)
+ */
+bool
+RunIdentifySystem(PGconn *conn, char **sysid, TimeLineID *starttli,
+				  XLogRecPtr *startpos, char **db_name)
+{
+	PGresult   *res;
+	uint32		hi,
+				lo;
+
+	/* Check connection existence */
+	//Assert(conn != NULL);
+    assert(conn != NULL);
+
+	res = PQexec(conn, "IDENTIFY_SYSTEM");
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		//pg_log_error("could not send replication command \"%s\": %s",
+		//			 "IDENTIFY_SYSTEM", PQerrorMessage(conn));
+        pgmoneta_log_error("could not send replication command \"%s\": %s",
+					 "IDENTIFY_SYSTEM", PQerrorMessage(conn));
+		PQclear(res);
+		return false;
+	}
+	if (PQntuples(res) != 1 || PQnfields(res) < 3)
+	{
+		//pg_log_error("could not identify system: got %d rows and %d fields, expected %d rows and %d or more fields",
+		//			 PQntuples(res), PQnfields(res), 1, 3);
+        pgmoneta_log_error("could not identify system: got %d rows and %d fields, expected %d rows and %d or more fields",
+					 PQntuples(res), PQnfields(res), 1, 3);
+		PQclear(res);
+		return false;
+	}
+
+	/* Get system identifier */
+	if (sysid != NULL)
+		*sysid = pg_strdup(PQgetvalue(res, 0, 0));
+
+	/* Get timeline ID to start streaming from */
+	if (starttli != NULL)
+		*starttli = atoi(PQgetvalue(res, 0, 1));
+
+	/* Get LSN start position if necessary */
+	if (startpos != NULL)
+	{
+		if (sscanf(PQgetvalue(res, 0, 2), "%X/%X", &hi, &lo) != 2)
+		{
+			//pg_log_error("could not parse write-ahead log location \"%s\"",
+			//			 PQgetvalue(res, 0, 2));
+            pgmoneta_log_error("could not parse write-ahead log location \"%s\"",
+						 PQgetvalue(res, 0, 2));
+			PQclear(res);
+			return false;
+		}
+		*startpos = ((uint64) hi) << 32 | lo;
+	}
+
+	/* Get database name, only available in 9.4 and newer versions */
+	if (db_name != NULL)
+	{
+		*db_name = NULL;
+		if (PQserverVersion(conn) >= 90400)
+		{
+			if (PQnfields(res) < 4)
+			{
+				//pg_log_error("could not identify system: got %d rows and %d fields, expected %d rows and %d or more fields",
+				//			 PQntuples(res), PQnfields(res), 1, 4);
+                pgmoneta_log_error("could not identify system: got %d rows and %d fields, expected %d rows and %d or more fields",
+							 PQntuples(res), PQnfields(res), 1, 4);
+				PQclear(res);
+				return false;
+			}
+			if (!PQgetisnull(res, 0, 3))
+				*db_name = pg_strdup(PQgetvalue(res, 0, 3));
+		}
+	}
+
+	PQclear(res);
+	return true;
+}
+
+/*
  * Start the log streaming
  */
 static void
@@ -1691,7 +1816,7 @@ StreamLog(void)
 		 */
 		exit(1);
 	}
-
+#endif
 	/*
 	 * Identify server, obtaining start LSN position and current timeline ID
 	 * at the same time, necessary if not valid data can be found in the
@@ -1699,7 +1824,7 @@ StreamLog(void)
 	 */
 	if (!RunIdentifySystem(conn, NULL, &servertli, &serverpos, NULL))
 		exit(1);
-#endif
+
 
 	/*
 	 * Figure out where to start streaming.
@@ -1793,9 +1918,10 @@ backup_wal_main(int srv, struct configuration* config, char* d) {
     /* determine remote server's xlog segment size 
 	if (!RetrieveWalSegSize(conn))
     */
+    WalSegSz = DEFAULT_XLOG_SEG_SIZE;
 
-    StreamLog();
-    /*
+    //StreamLog();
+    
 	while (true)
 	{
 		StreamLog();
@@ -1805,17 +1931,21 @@ backup_wal_main(int srv, struct configuration* config, char* d) {
 		}
 		else if (noloop)
 		{
-			pg_log_error("disconnected");
+			//pg_log_error("disconnected");
+            pgmoneta_log_error("disconnected");
 			exit(1);
 		}
 		else
 		{
-			pg_log_info("disconnected; waiting %d seconds to try again",
+			//pg_log_info("disconnected; waiting %d seconds to try again",
+			//			RECONNECT_SLEEP_TIME);
+            pgmoneta_log_info("disconnected; waiting %d seconds to try again",
 						RECONNECT_SLEEP_TIME);
-			pg_usleep(RECONNECT_SLEEP_TIME * 1000000);
+			//pg_usleep(RECONNECT_SLEEP_TIME * 1000000);
+            sleep(5);
 		}
 	}
-    */
+    
 
     return 1;
 }
