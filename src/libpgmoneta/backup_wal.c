@@ -17,7 +17,7 @@
 #include <assert.h>
 //#include <streamutil.h>
 //#include <xlogdefs.h>
-
+//#include <walmethods.h>
 /* system */
 #include <ev.h>
 #include <stdlib.h>
@@ -928,13 +928,14 @@ open_walfile(StreamCtl *stream, XLogRecPtr startpoint)
 	ssize_t		size;
 	XLogSegNo	segno;
 
+    pgmoneta_log_info("konglx: open_walfile begin to execute");
 	XLByteToSeg(startpoint, segno, WalSegSz);
 	XLogFileName(current_walfile_name, stream->timeline, segno, WalSegSz);
 
 	/* Note that this considers the compression used if necessary */
 	fn = stream->walmethod->get_file_name(current_walfile_name,
 										  stream->partial_suffix);
-
+    pgmoneta_log_info("konglx: stream->walmethod->get_file_name is over");
 	/*
 	 * When streaming to files, if an existing file exists we verify that it's
 	 * either empty (just created), or a complete WalSegSz segment (in which
@@ -945,9 +946,13 @@ open_walfile(StreamCtl *stream, XLogRecPtr startpoint)
 	 * When streaming to tar, no file with this name will exist before, so we
 	 * never have to verify a size.
 	 */
-	if (stream->walmethod->compression() == 0 &&
+    pgmoneta_log_info("ready to test exist");
+    //konglx change here
+	//if (stream->walmethod->compression() == 0 &&
+    if (0 == 0 &&
 		stream->walmethod->existsfile(fn))
 	{
+        pgmoneta_log_info("stream->walmethod->compression() == 0 && stream->walmethod->existsfile(fn)");
 		size = stream->walmethod->get_file_size(fn);
 		if (size < 0)
 		{
@@ -960,6 +965,7 @@ open_walfile(StreamCtl *stream, XLogRecPtr startpoint)
 		}
 		if (size == WalSegSz)
 		{
+            pgmoneta_log_info("konglx: Already padded file. Open it for use");
 			/* Already padded file. Open it for use */
 			f = stream->walmethod->open_for_write(current_walfile_name, stream->partial_suffix, 0);
 			if (f == NULL)
@@ -972,6 +978,7 @@ open_walfile(StreamCtl *stream, XLogRecPtr startpoint)
 				return false;
 			}
 
+            pgmoneta_log_info("konglx: stream->walmethod->sync(f) ready to exec");
 			/* fsync file in case of a previous crash */
 			if (stream->walmethod->sync(f) != 0)
 			{
@@ -1008,7 +1015,7 @@ open_walfile(StreamCtl *stream, XLogRecPtr startpoint)
 	}
 
 	/* No file existed, so create one */
-
+    pgmoneta_log_info("konglx: stream->walmethod->open_for_write");
 	f = stream->walmethod->open_for_write(current_walfile_name,
 										  stream->partial_suffix, WalSegSz);
 	if (f == NULL)
@@ -1072,7 +1079,7 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	 */
 	if (walfile == NULL)
 	{
-        pgmoneta_log_error("walfile == NULL");
+        pgmoneta_log_info("konglx:walfile == NULL");
 		/* No file open yet */
 		if (xlogoff != 0)
 		{
@@ -1085,7 +1092,7 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	}
 	else
 	{
-        pgmoneta_log_info("walfile != NULL");
+        pgmoneta_log_info("konglx:walfile != NULL");
 		/* More data in existing segment */
 		if (stream->walmethod->get_current_pos(walfile) != xlogoff)
 		{
@@ -1100,6 +1107,8 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	bytes_left = len - hdr_len;
 	bytes_written = 0;
 
+    pgmoneta_log_info("konglx: bytes_left %d",bytes_left);
+
 	while (bytes_left)
 	{
 		int			bytes_to_write;
@@ -1113,8 +1122,10 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 		else
 			bytes_to_write = bytes_left;
 
+        pgmoneta_log_info("konglx: open_walfile ");
 		if (walfile == NULL)
 		{
+            pgmoneta_log_info("konglx: walfile == NULL");
 			if (!open_walfile(stream, *blockpos))
 			{
 				/* Error logged by open_walfile */
@@ -1122,7 +1133,7 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 				return false;
 			}
 		}
-        pgmoneta_log_info("stream->walmethod->write");
+        pgmoneta_log_info("konglx:stream->walmethod->write begin write!");
 		if (stream->walmethod->write(walfile, copybuf + hdr_len + bytes_written,
 									 bytes_to_write) != bytes_to_write)
 		{
@@ -1142,7 +1153,7 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 		*blockpos += bytes_to_write;
 		xlogoff += bytes_to_write;
 
-        pgmoneta_log_info("Write was successful, advance our position");
+        pgmoneta_log_info("konglx: Write was successful, advance our position");
 		/* Did we reach the end of a WAL segment? */
 		if (XLogSegmentOffset(*blockpos, WalSegSz) == 0)
 		{
@@ -1673,29 +1684,6 @@ error:
 }
 
 /*
- * "Safe" wrapper around strdup().
- */
-char *
-pg_strdup(const char *in)
-{
-	char	   *tmp;
-
-	if (!in)
-	{
-		fprintf(stderr,
-				("cannot duplicate null pointer (internal error)\n"));
-		exit(EXIT_FAILURE);
-	}
-	tmp = strdup(in);
-	if (!tmp)
-	{
-		fprintf(stderr, ("out of memory\n"));
-		exit(EXIT_FAILURE);
-	}
-	return tmp;
-}
-
-/*
  * Run IDENTIFY_SYSTEM through a given connection and give back to caller
  * some result information if requested:
  * - System identifier
@@ -1856,8 +1844,8 @@ StreamLog(void)
 	stream.synchronous = synchronous;
 	stream.do_sync = do_sync;
 	stream.mark_done = false;
-	//stream.walmethod = CreateWalDirectoryMethod(basedir, compresslevel,
-												//stream.do_sync);
+	stream.walmethod = CreateWalDirectoryMethod(basedir, compresslevel,
+												stream.do_sync);
 	stream.partial_suffix = ".partial";
 	stream.replication_slot = replication_slot;
 
@@ -1920,8 +1908,8 @@ backup_wal_main(int srv, struct configuration* config, char* d) {
     */
     WalSegSz = DEFAULT_XLOG_SEG_SIZE;
 
-    //StreamLog();
-    
+    StreamLog();
+    /*
 	while (true)
 	{
 		StreamLog();
@@ -1944,7 +1932,7 @@ backup_wal_main(int srv, struct configuration* config, char* d) {
 			//pg_usleep(RECONNECT_SLEEP_TIME * 1000000);
             sleep(5);
 		}
-	}
+	}*/
     
 
     return 1;

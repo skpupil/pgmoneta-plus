@@ -8,7 +8,12 @@
  *		  src/bin/pg_basebackup/walmethods.h
  *-------------------------------------------------------------------------
  */
-
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+#include <stdarg.h>
+#include <stdbool.h>
 
 typedef void *Walfile;
 
@@ -18,6 +23,8 @@ typedef enum
 	CLOSE_UNLINK,
 	CLOSE_NO_RENAME
 } WalCloseMethod;
+
+//typedef unsigned int     size_t;
 
 /*
  * A WalWriteMethod structure represents the different methods used
@@ -29,7 +36,7 @@ typedef enum
  * care not to clobber errno between a failed method call and use of
  * getlasterror() to retrieve the message.
  */
-typedef struct WalWriteMethod WalWriteMethod;
+
 struct WalWriteMethod
 {
 	/*
@@ -86,7 +93,7 @@ struct WalWriteMethod
 	/* Return a text for the last error in this Walfile */
 	const char *(*getlasterror) (void);
 };
-
+typedef struct WalWriteMethod WalWriteMethod;
 /*
  * Available WAL methods:
  *	- WalDirectoryMethod - write WAL to regular files in a standard pg_wal
