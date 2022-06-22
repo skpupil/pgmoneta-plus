@@ -96,14 +96,7 @@
 #define MCXT_ALLOC_ZERO			0x04	/* zero allocated memory */
 
 
-#define O_RDONLY      0x0000  // open for reading only
-#define O_WRONLY      0x0001  // open for writing only
-#define O_RDWR        0x0002  // open for reading and writing
-#define O_APPEND      0x0008  // writes done at eof
 
-#define O_CREAT       0x0100  // create and open file
-#define O_TRUNC       0x0200  // open and truncate
-#define O_EXCL        0x0400  // open only if file doesn't already exist
 
 typedef long long int int64;
 
@@ -756,6 +749,155 @@ dir_finish(void)
 	return true;
 }
 
+/*
+ * durable_rename -- rename(2) wrapper, issuing fsyncs required for durability
+ *
+ * Wrapper around rename, similar to the backend version.
+ */
+int
+durable_rename(const char *oldfile, const char *newfile)
+{
+	int			fd;
+
+	/*
+	 * First fsync the old and target path (if it exists), to ensure that they
+	 * are properly persistent on disk. Syncing the target file is not
+	 * strictly necessary, but it makes it easier to reason about crashes;
+	 * because it's then guaranteed that either source or target file exists
+	 * after a crash.
+	 */
+	if (fsync_fname(oldfile, false) != 0)
+		return -1;
+
+	fd = open(newfile, PG_BINARY | O_RDWR, 0);
+	if (fd < 0)
+	{
+		if (errno != ENOENT)
+		{
+			//pg_log_error("could not open file \"%s\": %m", newfile);
+			pgmoneta_log_error("could not open file \"%s\": %m", newfile);
+			return -1;
+		}
+	}
+	else
+	{
+		if (fsync(fd) != 0)
+		{
+			//pg_log_fatal("could not fsync file \"%s\": %m", newfile);
+			pgmoneta_log_fatal("could not fsync file \"%s\": %m", newfile);
+			close(fd);
+			exit(EXIT_FAILURE);
+		}
+		close(fd);
+	}
+
+	/* Time to do the real deal... */
+	if (rename(oldfile, newfile) != 0)
+	{
+		//pg_log_error("could not rename file \"%s\" to \"%s\": %m",
+		//			 oldfile, newfile);
+		pgmoneta_log_error("could not rename file \"%s\" to \"%s\": %m",
+					 oldfile, newfile);
+		return -1;
+	}
+
+	/*
+	 * To guarantee renaming the file is persistent, fsync the file with its
+	 * new name, and its containing directory.
+	 */
+	if (fsync_fname(newfile, false) != 0)
+		return -1;
+
+	if (fsync_parent_path(newfile) != 0)
+		return -1;
+
+	return 0;
+}
+
+static int
+dir_close(Walfile f, WalCloseMethod method)
+{
+	int			r;
+	DirectoryMethodFile *df = (DirectoryMethodFile *) f;
+	char		tmppath[MAXPGPATH];
+	char		tmppath2[MAXPGPATH];
+
+	//Assert(f != NULL);
+	dir_clear_error();
+
+#ifdef HAVE_LIBZppp
+	if (dir_data->compression > 0)
+	{
+		errno = 0;				/* in case gzclose() doesn't set it */
+		r = gzclose(df->gzfp);
+	}
+	else
+#endif
+		r = close(df->fd);
+
+	if (r == 0)
+	{
+		/* Build path to the current version of the file */
+		if (method == CLOSE_NORMAL && df->temp_suffix)
+		{
+			char	   *filename;
+			char	   *filename2;
+
+			/*
+			 * If we have a temp prefix, normal operation is to rename the
+			 * file.
+			 */
+			filename = dir_get_file_name(df->pathname, df->temp_suffix);
+			snprintf(tmppath, sizeof(tmppath), "%s/%s",
+					 dir_data->basedir, filename);
+			pg_free(filename);
+
+			/* permanent name, so no need for the prefix */
+			filename2 = dir_get_file_name(df->pathname, NULL);
+			snprintf(tmppath2, sizeof(tmppath2), "%s/%s",
+					 dir_data->basedir, filename2);
+			pg_free(filename2);
+			r = durable_rename(tmppath, tmppath2);
+		}
+		else if (method == CLOSE_UNLINK)
+		{
+			char	   *filename;
+
+			/* Unlink the file once it's closed */
+			filename = dir_get_file_name(df->pathname, df->temp_suffix);
+			snprintf(tmppath, sizeof(tmppath), "%s/%s",
+					 dir_data->basedir, filename);
+			pg_free(filename);
+			r = unlink(tmppath);
+		}
+		else
+		{
+			/*
+			 * Else either CLOSE_NORMAL and no temp suffix, or
+			 * CLOSE_NO_RENAME. In this case, fsync the file and containing
+			 * directory if sync mode is requested.
+			 */
+			if (dir_data->sync)
+			{
+				r = fsync_fname(df->fullpath, false);
+				if (r == 0)
+					r = fsync_parent_path(df->fullpath);
+			}
+		}
+	}
+
+	if (r != 0)
+		dir_data->lasterrno = errno;
+
+	pg_free(df->pathname);
+	pg_free(df->fullpath);
+	if (df->temp_suffix)
+		pg_free(df->temp_suffix);
+	pg_free(df);
+
+	return r;
+}
+
 
 WalWriteMethod *
 CreateWalDirectoryMethod(const char *basedir, int compression, bool sync)
@@ -769,7 +911,7 @@ CreateWalDirectoryMethod(const char *basedir, int compression, bool sync)
 	method->get_file_size = dir_get_file_size;
 	method->get_file_name = dir_get_file_name;
 	//method->compression = dir_compression;
-	//method->close = dir_close;
+	method->close = dir_close;
 	method->sync = dir_sync;
 	method->existsfile = dir_existsfile;
 	method->finish = dir_finish;

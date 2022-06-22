@@ -348,6 +348,37 @@ stop_streaming(XLogRecPtr xlogpos, uint32 timeline, bool segment_finished)
 	return false;
 }
 
+static bool
+mark_file_as_archived(StreamCtl *stream, const char *fname)
+{
+	Walfile    *f;
+	static char tmppath[MAXPGPATH];
+
+	snprintf(tmppath, sizeof(tmppath), "archive_status/%s.done",
+			 fname);
+
+	f = stream->walmethod->open_for_write(tmppath, NULL, 0);
+	if (f == NULL)
+	{
+		//pg_log_error("could not create archive status file \"%s\": %s",
+		//			 tmppath, stream->walmethod->getlasterror());
+		pgmoneta_log_error("could not create archive status file \"%s\": %s",
+					 tmppath, stream->walmethod->getlasterror());
+		return false;
+	}
+
+	if (stream->walmethod->close(f, CLOSE_NORMAL) != 0)
+	{
+		//pg_log_error("could not close archive status file \"%s\": %s",
+		//			 tmppath, stream->walmethod->getlasterror());
+		pgmoneta_log_error("could not close archive status file \"%s\": %s",
+					 tmppath, stream->walmethod->getlasterror());
+		return false;
+	}
+
+	return true;
+}
+
 /*
  * Close the current WAL file (if open), and rename it to the correct
  * filename if it's complete. On failure, prints an error message to stderr
@@ -356,7 +387,7 @@ stop_streaming(XLogRecPtr xlogpos, uint32 timeline, bool segment_finished)
 static bool
 close_walfile(StreamCtl *stream, XLogRecPtr pos)
 {
-#ifdef close_wal
+//#ifdef close_wal
 	off_t		currpos;
 	int			r;
 
@@ -417,7 +448,7 @@ close_walfile(StreamCtl *stream, XLogRecPtr pos)
 	}
 
 	lastFlushPosition = pos;
-#endif
+//#endif
 	return true;
 }
 
@@ -1072,7 +1103,7 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 
 	/* Extract WAL location for this block */
 	xlogoff = XLogSegmentOffset(*blockpos, WalSegSz);
-
+	pgmoneta_log_info("WalSegSz: WalSegSz backup_wal.c 1075 %d",WalSegSz);
 	/*
 	 * Verify that the initial location in the stream matches where we think
 	 * we are.
