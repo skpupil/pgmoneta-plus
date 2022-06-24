@@ -108,3 +108,9 @@ WalWriteMethod *CreateWalTarMethod(const char *tarbase, int compression, bool sy
 /* Cleanup routines for previously-created methods */
 void		FreeWalDirectoryMethod(void);
 void		FreeWalTarMethod(void);
+
+char *
+pg_strdup(const char *in);
+
+void
+pg_free(void *ptr);

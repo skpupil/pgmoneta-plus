@@ -924,3 +924,12 @@ CreateWalDirectoryMethod(const char *basedir, int compression, bool sync)
 
 	return method;
 }
+
+
+void
+FreeWalDirectoryMethod(void)
+{
+	pg_free(dir_data->basedir);
+	pg_free(dir_data);
+	dir_data = NULL;
+}

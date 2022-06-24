@@ -13,6 +13,8 @@
 #include <backup_wal.h>
 #include <utils.h>
 #include <xlogdefs.h>
+#include <dirent.h>
+#include <errno.h>
 //#include <port.h>
 #include <assert.h>
 //#include <streamutil.h>
@@ -115,11 +117,135 @@ pg_free(void *ptr)
 		free(ptr);
 }
 
+
+/*
+ * Get destination directory.
+ */
+static DIR *
+get_destination_dir(char *dest_folder)
+{
+	DIR		   *dir;
+
+	//Assert(dest_folder != NULL);
+	dir = opendir(dest_folder);
+	if (dir == NULL)
+	{
+		//pg_log_error("could not open directory \"%s\": %m", basedir);
+		pgmoneta_log_error("could not open directory \"%s\": %m", basedir);
+		exit(1);
+	}
+
+	return dir;
+}
+
+
+/*
+ * Close existing directory.
+ */
+static void
+close_destination_dir(DIR *dest_dir, char *dest_folder)
+{
+	//Assert(dest_dir != NULL && dest_folder != NULL);
+	if (closedir(dest_dir))
+	{
+		//pg_log_error("could not close directory \"%s\": %m", dest_folder);
+		pgmoneta_log_error("could not close directory \"%s\": %m", dest_folder);
+		exit(1);
+	}
+}
+
+
+
 /*
  * This is the default value for wal_segment_size to be used when initdb is run
  * without the --wal-segsize option.  It must be a valid segment size.
  */
 #define DEFAULT_XLOG_SEG_SIZE	(16*1024*1024)
+#define PG_BINARY	0
+
+#define XLogSegmentsPerXLogId(wal_segsz_bytes)	\
+	(UINT64CONST(0x100000000) / (wal_segsz_bytes))
+
+
+/* Length of XLog file name */
+#define XLOG_FNAME_LEN	   24
+
+
+/*
+ * Generate a WAL segment file name.  Do not use this macro in a helper
+ * function allocating the result generated.
+ */
+#define XLogFileName(fname, tli, logSegNo, wal_segsz_bytes)	\
+	snprintf(fname, MAXFNAMELEN, "%08X%08X%08X", tli,		\
+			 (uint32) ((logSegNo) / XLogSegmentsPerXLogId(wal_segsz_bytes)), \
+			 (uint32) ((logSegNo) % XLogSegmentsPerXLogId(wal_segsz_bytes)))
+
+#define XLogFileNameById(fname, tli, log, seg)	\
+	snprintf(fname, MAXFNAMELEN, "%08X%08X%08X", tli, log, seg)
+
+#define IsXLogFileName(fname) \
+	(strlen(fname) == XLOG_FNAME_LEN && \
+	 strspn(fname, "0123456789ABCDEF") == XLOG_FNAME_LEN)
+
+/*
+ * XLOG segment with .partial suffix.  Used by pg_receivewal and at end of
+ * archive recovery, when we want to archive a WAL segment but it might not
+ * be complete yet.
+ */
+#define IsPartialXLogFileName(fname)	\
+	(strlen(fname) == XLOG_FNAME_LEN + strlen(".partial") &&	\
+	 strspn(fname, "0123456789ABCDEF") == XLOG_FNAME_LEN &&		\
+	 strcmp((fname) + XLOG_FNAME_LEN, ".partial") == 0)
+
+#define XLogFromFileName(fname, tli, logSegNo, wal_segsz_bytes)	\
+	do {												\
+		uint32 log;										\
+		uint32 seg;										\
+		sscanf(fname, "%08X%08X%08X", tli, &log, &seg); \
+		*logSegNo = (uint64) log * XLogSegmentsPerXLogId(wal_segsz_bytes) + seg; \
+	} while (0)
+
+#define XLogFilePath(path, tli, logSegNo, wal_segsz_bytes)	\
+	snprintf(path, MAXPGPATH, XLOGDIR "/%08X%08X%08X", tli,	\
+			 (uint32) ((logSegNo) / XLogSegmentsPerXLogId(wal_segsz_bytes)), \
+			 (uint32) ((logSegNo) % XLogSegmentsPerXLogId(wal_segsz_bytes)))
+
+#define TLHistoryFileName(fname, tli)	\
+	snprintf(fname, MAXFNAMELEN, "%08X.history", tli)
+
+#define IsTLHistoryFileName(fname)	\
+	(strlen(fname) == 8 + strlen(".history") &&		\
+	 strspn(fname, "0123456789ABCDEF") == 8 &&		\
+	 strcmp((fname) + 8, ".history") == 0)
+
+#define TLHistoryFilePath(path, tli)	\
+	snprintf(path, MAXPGPATH, XLOGDIR "/%08X.history", tli)
+
+#define StatusFilePath(path, xlog, suffix)	\
+	snprintf(path, MAXPGPATH, XLOGDIR "/archive_status/%s%s", xlog, suffix)
+
+#define BackupHistoryFileName(fname, tli, logSegNo, startpoint, wal_segsz_bytes) \
+	snprintf(fname, MAXFNAMELEN, "%08X%08X%08X.%08X.backup", tli, \
+			 (uint32) ((logSegNo) / XLogSegmentsPerXLogId(wal_segsz_bytes)), \
+			 (uint32) ((logSegNo) % XLogSegmentsPerXLogId(wal_segsz_bytes)), \
+			 (uint32) (XLogSegmentOffset(startpoint, wal_segsz_bytes)))
+
+#define IsBackupHistoryFileName(fname) \
+	(strlen(fname) > XLOG_FNAME_LEN && \
+	 strspn(fname, "0123456789ABCDEF") == XLOG_FNAME_LEN && \
+	 strcmp((fname) + strlen(fname) - strlen(".backup"), ".backup") == 0)
+
+#define BackupHistoryFilePath(path, tli, logSegNo, startpoint, wal_segsz_bytes)	\
+	snprintf(path, MAXPGPATH, XLOGDIR "/%08X%08X%08X.%08X.backup", tli, \
+			 (uint32) ((logSegNo) / XLogSegmentsPerXLogId(wal_segsz_bytes)), \
+			 (uint32) ((logSegNo) % XLogSegmentsPerXLogId(wal_segsz_bytes)), \
+			 (uint32) (XLogSegmentOffset((startpoint), wal_segsz_bytes)))
+
+
+#define XLogSegNoOffsetToRecPtr(segno, offset, wal_segsz_bytes, dest) \
+		(dest) = (segno) * (wal_segsz_bytes) + (offset)
+
+
 
 /*
  * Determine starting location for streaming, based on any existing xlog
@@ -131,7 +257,7 @@ pg_free(void *ptr)
 static XLogRecPtr
 FindStreamingStart(uint32 *tli)
 {
-#ifdef findstart
+//#ifdef findstart
 	DIR		   *dir;
 	struct dirent *dirent;
 	XLogSegNo	high_segno = 0;
@@ -160,16 +286,16 @@ FindStreamingStart(uint32 *tli)
 			ispartial = true;
 			iscompress = false;
 		}
-		else if (IsCompressXLogFileName(dirent->d_name))
-		{
-			ispartial = false;
-			iscompress = true;
-		}
-		else if (IsPartialCompressXLogFileName(dirent->d_name))
-		{
-			ispartial = true;
-			iscompress = true;
-		}
+		//else if (IsCompressXLogFileName(dirent->d_name))
+		//{
+		//	ispartial = false;
+		//	iscompress = true;
+		//}
+		//else if (IsPartialCompressXLogFileName(dirent->d_name))
+		//{
+		//	ispartial = true;
+		//	iscompress = true;
+		//}
 		else
 			continue;
 
@@ -196,13 +322,16 @@ FindStreamingStart(uint32 *tli)
 			snprintf(fullpath, sizeof(fullpath), "%s/%s", basedir, dirent->d_name);
 			if (stat(fullpath, &statbuf) != 0)
 			{
-				pg_log_error("could not stat file \"%s\": %m", fullpath);
+				//pg_log_error("could not stat file \"%s\": %m", fullpath);
+				pgmoneta_log_error("could not stat file \"%s\": %m", fullpath);
 				exit(1);
 			}
 
 			if (statbuf.st_size != WalSegSz)
 			{
-				pg_log_warning("segment file \"%s\" has incorrect size %lld, skipping",
+				//pg_log_warning("segment file \"%s\" has incorrect size %lld, skipping",
+				//			   dirent->d_name, (long long int) statbuf.st_size);
+				pgmoneta_log_error("segment file \"%s\" has incorrect size %lld, skipping",
 							   dirent->d_name, (long long int) statbuf.st_size);
 				continue;
 			}
@@ -220,13 +349,17 @@ FindStreamingStart(uint32 *tli)
 			fd = open(fullpath, O_RDONLY | PG_BINARY, 0);
 			if (fd < 0)
 			{
-				pg_log_error("could not open compressed file \"%s\": %m",
+				//pg_log_error("could not open compressed file \"%s\": %m",
+				//			 fullpath);
+				pgmoneta_log_error("could not open compressed file \"%s\": %m",
 							 fullpath);
 				exit(1);
 			}
 			if (lseek(fd, (off_t) (-4), SEEK_END) < 0)
 			{
-				pg_log_error("could not seek in compressed file \"%s\": %m",
+				//pg_log_error("could not seek in compressed file \"%s\": %m",
+				//			 fullpath);
+				pgmoneta_log_error("could not seek in compressed file \"%s\": %m",
 							 fullpath);
 				exit(1);
 			}
@@ -234,10 +367,14 @@ FindStreamingStart(uint32 *tli)
 			if (r != sizeof(buf))
 			{
 				if (r < 0)
-					pg_log_error("could not read compressed file \"%s\": %m",
+					//pg_log_error("could not read compressed file \"%s\": %m",
+					//			 fullpath);
+					pgmoneta_log_error("could not read compressed file \"%s\": %m",
 								 fullpath);
 				else
-					pg_log_error("could not read compressed file \"%s\": read %d of %zu",
+					//pg_log_error("could not read compressed file \"%s\": read %d of %zu",
+					//			 fullpath, r, sizeof(buf));
+					pgmoneta_log_error("could not read compressed file \"%s\": read %d of %zu",
 								 fullpath, r, sizeof(buf));
 				exit(1);
 			}
@@ -248,7 +385,9 @@ FindStreamingStart(uint32 *tli)
 
 			if (bytes_out != WalSegSz)
 			{
-				pg_log_warning("compressed segment file \"%s\" has incorrect uncompressed size %d, skipping",
+				//pg_log_warning("compressed segment file \"%s\" has incorrect uncompressed size %d, skipping",
+				//			   dirent->d_name, bytes_out);
+				pgmoneta_log_error("compressed segment file \"%s\" has incorrect uncompressed size %d, skipping",
 							   dirent->d_name, bytes_out);
 				continue;
 			}
@@ -267,7 +406,8 @@ FindStreamingStart(uint32 *tli)
 
 	if (errno)
 	{
-		pg_log_error("could not read directory \"%s\": %m", basedir);
+		//pg_log_error("could not read directory \"%s\": %m", basedir);
+		pgmoneta_log_error("could not read directory \"%s\": %m", basedir);
 		exit(1);
 	}
 
@@ -291,7 +431,7 @@ FindStreamingStart(uint32 *tli)
 		return high_ptr;
 	}
 	else
-#endif
+//#endif
 		return InvalidXLogRecPtr;
 }
 
@@ -937,11 +1077,11 @@ fe_recvint64(char *buf)
 
 #define XLogFileNameById(fname, tli, log, seg)	\
 	snprintf(fname, MAXFNAMELEN, "%08X%08X%08X", tli, log, seg)
-
+/*
 #define IsXLogFileName(fname) \
 	(strlen(fname) == XLOG_FNAME_LEN && \
 	 strspn(fname, "0123456789ABCDEF") == XLOG_FNAME_LEN)
-
+*/
 /*
  * Open a new WAL file in the specified directory.
  *
@@ -1100,6 +1240,8 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 		return false;
 	}
 	*blockpos = fe_recvint64(&copybuf[1]);
+
+	pgmoneta_log_info("konglx:*blockpos = fe_recvint64(&copybuf[1]);  %d",*blockpos);
 
 	/* Extract WAL location for this block */
 	xlogoff = XLogSegmentOffset(*blockpos, WalSegSz);
@@ -1291,6 +1433,8 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 		sleeptime = CalculateCopyStreamSleeptime(now, stream->standby_message_timeout,
 												 last_status);
 
+		pgmoneta_log_info("konglx: sleeptime = CalculateCopyStreamSleeptime: %d ", sleeptime);
+
 		r = CopyStreamReceive(conn, sleeptime, stream->stop_socket, &copybuf);
 		while (r != 0)
 		{
@@ -1395,6 +1539,96 @@ ReadEndOfStreamingResult(PGresult *res, XLogRecPtr *startpos, uint32 *timeline)
 
 	return true;
 }
+
+
+/*
+ * Check if a timeline history file exists.
+ */
+static bool
+existsTimeLineHistoryFile(StreamCtl *stream)
+{
+	char		histfname[MAXFNAMELEN];
+
+	/*
+	 * Timeline 1 never has a history file. We treat that as if it existed,
+	 * since we never need to stream it.
+	 */
+	if (stream->timeline == 1)
+		return true;
+
+	TLHistoryFileName(histfname, stream->timeline);
+
+	return stream->walmethod->existsfile(histfname);
+}
+
+
+
+static bool
+writeTimeLineHistoryFile(StreamCtl *stream, char *filename, char *content)
+{
+	int			size = strlen(content);
+	char		histfname[MAXFNAMELEN];
+	Walfile    *f;
+
+	/*
+	 * Check that the server's idea of how timeline history files should be
+	 * named matches ours.
+	 */
+	TLHistoryFileName(histfname, stream->timeline);
+	if (strcmp(histfname, filename) != 0)
+	{
+		//pg_log_error("server reported unexpected history file name for timeline %u: %s",
+		//			 stream->timeline, filename);
+		pgmoneta_log_error("server reported unexpected history file name for timeline %u: %s",
+					 stream->timeline, filename);
+		return false;
+	}
+
+	f = stream->walmethod->open_for_write(histfname, ".tmp", 0);
+	if (f == NULL)
+	{
+		//pg_log_error("could not create timeline history file \"%s\": %s",
+		//			 histfname, stream->walmethod->getlasterror());
+		pgmoneta_log_error("could not create timeline history file \"%s\": %s",
+					 histfname, stream->walmethod->getlasterror());
+		return false;
+	}
+
+	if ((int) stream->walmethod->write(f, content, size) != size)
+	{
+		//pg_log_error("could not write timeline history file \"%s\": %s",
+		//			 histfname, stream->walmethod->getlasterror());
+		pgmoneta_log_error("could not write timeline history file \"%s\": %s",
+					 histfname, stream->walmethod->getlasterror());
+
+		/*
+		 * If we fail to make the file, delete it to release disk space
+		 */
+		stream->walmethod->close(f, CLOSE_UNLINK);
+
+		return false;
+	}
+
+	if (stream->walmethod->close(f, CLOSE_NORMAL) != 0)
+	{
+		//pg_log_error("could not close file \"%s\": %s",
+		//			 histfname, stream->walmethod->getlasterror());
+		pgmoneta_log_error("could not close file \"%s\": %s",
+					 histfname, stream->walmethod->getlasterror());
+		return false;
+	}
+
+	/* Maintain archive_status, check close_walfile() for details. */
+	if (stream->mark_done)
+	{
+		/* writes error message if failed */
+		if (!mark_file_as_archived(stream, histfname))
+			return false;
+	}
+
+	return true;
+}
+
 
 
 /*
@@ -1528,15 +1762,15 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 
 	while (1)
 	{
-#ifdef historyfile_	
+
         /*
 		 * Fetch the timeline history file for this timeline, if we don't have
 		 * it already. When streaming log to tar, this will always return
 		 * false, as we are never streaming into an existing file and
 		 * therefore there can be no pre-existing timeline history file.
 		 */
-		//if (!existsTimeLineHistoryFile(stream))
-		//{
+		if (!existsTimeLineHistoryFile(stream))
+		{
 			snprintf(query, sizeof(query), "TIMELINE_HISTORY %u", stream->timeline);
 			res = PQexec(conn, query);
 			if (PQresultStatus(res) != PGRES_TUPLES_OK)
@@ -1568,7 +1802,7 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 									 PQgetvalue(res, 0, 1));
 
 			PQclear(res);
-		//}
+		}
 
 		/*
 		 * Before we start streaming from the requested location, check if the
@@ -1576,7 +1810,7 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 		 */
 		if (stream->stream_stop(stream->startpos, stream->timeline, false))
 			return true;
-#endif
+
 		/* Initiate the replication stream at specified location */
 		snprintf(query, sizeof(query), "START_REPLICATION %s%X/%X TIMELINE %u",
 				 slotcmd,
@@ -1713,6 +1947,7 @@ error:
 	walfile = NULL;
 	return false;
 }
+
 
 /*
  * Run IDENTIFY_SYSTEM through a given connection and give back to caller
@@ -1854,12 +2089,12 @@ StreamLog(void)
 		stream.startpos = serverpos;
 		stream.timeline = servertli;
 	}
-#ifdef segoffsets
+
 	/*
 	 * Always start streaming at the beginning of a segment
 	 */
 	stream.startpos -= XLogSegmentOffset(stream.startpos, WalSegSz);
-#endif
+
 #ifdef verbose_
 	/*
 	 * Start the replication
@@ -1884,17 +2119,16 @@ StreamLog(void)
 
 	if (!stream.walmethod->finish())
 	{
-#ifdef verbose_
-		pg_log_info("could not finish writing WAL files: %m");
-#endif
+		//pg_log_info("could not finish writing WAL files: %m");
+		pgmoneta_log_info("could not finish writing WAL files: %m");
 		return;
 	}
 
 	PQfinish(conn);
 	conn = NULL;
 
-	//FreeWalDirectoryMethod();
-	//pg_free(stream.walmethod);
+	FreeWalDirectoryMethod();
+	pg_free(stream.walmethod);
 
 	conn = NULL;
 }
@@ -1939,8 +2173,8 @@ backup_wal_main(int srv, struct configuration* config, char* d) {
     */
     WalSegSz = DEFAULT_XLOG_SEG_SIZE;
 
-    StreamLog();
-    /*
+    //StreamLog();
+    
 	while (true)
 	{
 		StreamLog();
@@ -1963,7 +2197,7 @@ backup_wal_main(int srv, struct configuration* config, char* d) {
 			//pg_usleep(RECONNECT_SLEEP_TIME * 1000000);
             sleep(5);
 		}
-	}*/
+	}
     
 
     return 1;
