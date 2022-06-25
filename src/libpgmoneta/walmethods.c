@@ -645,6 +645,7 @@ dir_write(Walfile f, const void *buf, size_t count)
 			dir_data->lasterrno = errno ? errno : ENOSPC;
 		}
 	}
+	pgmoneta_log_info("konglx: df->currpos += r; %d", r);
 	if (r > 0)
 		df->currpos += r;
 	return r;

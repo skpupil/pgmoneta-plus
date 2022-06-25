@@ -1017,6 +1017,20 @@ HandleEndOfCopyStream(PGconn *conn, StreamCtl *stream, char *copybuf,
 	return res;
 }
 
+static inline uint64
+pg_bswap64(uint64 x)
+{
+	return
+		((x << 56) & UINT64CONST(0xff00000000000000)) |
+		((x << 40) & UINT64CONST(0x00ff000000000000)) |
+		((x << 24) & UINT64CONST(0x0000ff0000000000)) |
+		((x << 8) & UINT64CONST(0x000000ff00000000)) |
+		((x >> 8) & UINT64CONST(0x00000000ff000000)) |
+		((x >> 24) & UINT64CONST(0x0000000000ff0000)) |
+		((x >> 40) & UINT64CONST(0x000000000000ff00)) |
+		((x >> 56) & UINT64CONST(0x00000000000000ff));
+}
+
 /*
  * Converts an int64 from network byte order to native format.
  */
@@ -1027,8 +1041,7 @@ fe_recvint64(char *buf)
 
 	memcpy(&n64, buf, sizeof(n64));
 
-	//return pg_ntoh64(n64);
-    return (int64)n64;
+	return pg_bswap64(n64);
 }
 
 /*
@@ -1282,10 +1295,12 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 
     pgmoneta_log_info("konglx: bytes_left %d",bytes_left);
 
+	pgmoneta_log_info("konglx: brefore while (bytes_left)");
+
 	while (bytes_left)
 	{
 		int			bytes_to_write;
-
+		pgmoneta_log_info("konglx: start loop bytes_left %d",bytes_left);
 		/*
 		 * If crossing a WAL boundary, only write up until we reach wal
 		 * segment size.
@@ -1294,7 +1309,7 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 			bytes_to_write = WalSegSz - xlogoff;
 		else
 			bytes_to_write = bytes_left;
-
+		pgmoneta_log_info("konglx: bytes_to_write: %d",bytes_to_write);
         pgmoneta_log_info("konglx: open_walfile ");
 		if (walfile == NULL)
 		{
@@ -1330,14 +1345,19 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 		/* Did we reach the end of a WAL segment? */
 		if (XLogSegmentOffset(*blockpos, WalSegSz) == 0)
 		{
-			if (!close_walfile(stream, *blockpos))
+			pgmoneta_log_info("konglx: start XLogSegmentOffset(*blockpos, WalSegSz) == 0");
+			if (!close_walfile(stream, *blockpos)) {
 				/* Error message written in close_walfile() */
+				pgmoneta_log_info("konglx: brefore return !close_walfile(stream, *blockpos)");
 				return false;
-
+			}
+			pgmoneta_log_info("konglx: xlogoff = 0;");
+			
 			xlogoff = 0;
 
 			if (still_sending && stream->stream_stop(*blockpos, stream->timeline, true))
 			{
+				pgmoneta_log_info("konglx: still_sending && stream->stream_stop is true");
 				if (PQputCopyEnd(conn, NULL) <= 0 || PQflush(conn))
 				{
 					//pg_log_error("could not send copy-end packet: %s",
@@ -1347,9 +1367,12 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 					return false;
 				}
 				still_sending = false;
+				pgmoneta_log_info("before return if still_sending && stream->stream_stop");
 				return true;	/* ignore the rest of this XLogData packet */
 			}
 		}
+
+		pgmoneta_log_info("konglx: end loop bytes_left %d",bytes_left);
 	}
 	/* No more data left to write, receive next copy packet */
 
@@ -1372,7 +1395,7 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 	char	   *copybuf = NULL;
 	TimestampTz last_status = -1;
 	XLogRecPtr	blockpos = stream->startpos;
-
+	pgmoneta_log_info("konglx: begin: HandleCopyStream: %d",stream->startpos);
 	still_sending = true;
 
 	while (1)
@@ -1409,6 +1432,7 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 			 * Send feedback so that the server sees the latest WAL locations
 			 * immediately.
 			 */
+			pgmoneta_log_info("konglx: begin: HandleCopyStream: blockpos: %d",blockpos);
 			if (!sendFeedback(conn, blockpos, now, false))
 				goto error;
 			last_status = now;
@@ -1421,6 +1445,7 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 			feTimestampDifferenceExceeds(last_status, now,
 										 stream->standby_message_timeout))
 		{
+			pgmoneta_log_info("konglx: begin: HandleCopyStream: blockpos22: %d",blockpos);
 			/* Time to send feedback! */
 			if (!sendFeedback(conn, blockpos, now, false))
 				goto error;
@@ -1436,6 +1461,8 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 		pgmoneta_log_info("konglx: sleeptime = CalculateCopyStreamSleeptime: %d ", sleeptime);
 
 		r = CopyStreamReceive(conn, sleeptime, stream->stop_socket, &copybuf);
+		pgmoneta_log_info("konglx: r = CopyStreamReceive %d",r);
+		// each  loop per packet 
 		while (r != 0)
 		{
 			if (r == -1)
@@ -1461,6 +1488,9 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 			else if (copybuf[0] == 'w')
 			{
                 pgmoneta_log_info("copybuf[0] == 'w'");
+
+				pgmoneta_log_info("konglx: before ProcessXLogDataMsg test copybuf[1]  %d",copybuf[1]);
+
 				if (!ProcessXLogDataMsg(conn, stream, copybuf, r, &blockpos))
 					goto error;
                 
@@ -1816,6 +1846,7 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 				 slotcmd,
 				 LSN_FORMAT_ARGS(stream->startpos),
 				 stream->timeline);
+		pgmoneta_log_info("konglx: query: %s",query);
 		res = PQexec(conn, query);
 		if (PQresultStatus(res) != PGRES_COPY_BOTH)
 		{
